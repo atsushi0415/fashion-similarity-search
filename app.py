@@ -33,7 +33,6 @@ MODEL_PATH_ABS = os.path.join('pthfile', 'fashion_classifier_model.pth')
 RAW_IMAGE_FILE = 'train-images-idx3-ubyte'
 MNIST_HEADER_SIZE = 16 
 
-# --- PyTorchモデルと前処理関数 ---
 
 # テンソル変換・3ch複製・正規化のみを行うパイプライン
 upload_tensor_transform = transforms.Compose([
@@ -45,7 +44,7 @@ upload_tensor_transform = transforms.Compose([
 ])
 
 
-# データのロード (サーバー起動時に一度だけ実行)
+# データのロード
 def load_data():
     """embeddings.pt ファイルから特徴ベクトルとFaissインデックスをロードする"""
     global EMBEDDINGS, LABELS, CLASS_NAMES, DATASET_SIZE, FAISS_INDEX, MODEL_FOR_UPLOAD
@@ -71,14 +70,18 @@ def load_data():
             
         FAISS_INDEX = faiss.read_index(BINFILE_PATH)
         print(f"Faissインデックスロード成功。次元: {FAISS_INDEX.d}")
+        
+        if isinstance(FAISS_INDEX, faiss.IndexIVFFlat):
+            # 検索時に探索するクラスタ数
+            FAISS_INDEX.nprobe = 10 
+            print(f"Faiss IndexIVFFlatをロードしました。nprobeを {FAISS_INDEX.nprobe} に設定しました。")
 
-        # 3. 特徴抽出モデルのロード (アップロード処理用)
+        # 3. 特徴抽出モデルのロード
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
         if not os.path.exists(MODEL_PATH_ABS):
             raise FileNotFoundError(f"モデル重みファイル '{MODEL_PATH_ABS}' が見つかりません。")
             
-        # feature_extractor_only=True で4096次元を出力するモデルをロード
         MODEL_FOR_UPLOAD = get_model(num_classes=num_classes, feature_extractor_only=True)
         
         # 学習済み重みのロード
