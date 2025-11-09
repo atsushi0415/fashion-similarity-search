@@ -5,53 +5,57 @@ import os
 import sys
 import faiss
 
-# モデルの初期化と重みのロード
-MODEL_PATH = 'fashion_classifier_model.pth'
+# --- パス定義 ---
+MODEL_PATH = os.path.join('pthfile', 'fashion_classifier_model.pth')
+PTFILE_PATH = os.path.join('ptfile', 'embeddings.pt')
+BINFILE_PATH = os.path.join('binfile', 'faiss_index.bin')
 
-# GPU/CPUの設定
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# 1. モデルの初期化と重みのロード
+device = torch.device("cuda:0") 
 print(f"特徴抽出デバイス: {device}")
 
-# モデル構造を定義
-model_for_extraction = get_model(num_classes=num_classes, feature_extractor_only=False)
-model_for_extraction.to(device)
+# model.pyのget_modelで、分類器が4096次元出力で切り詰められる
+model_for_extraction = get_model(num_classes=num_classes, feature_extractor_only=True)
+model_for_extraction.to(device) 
 
 try:
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"モデルファイル '{MODEL_PATH}' が見つかりません。")
+        
     state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    model_for_extraction.load_state_dict(state_dict)
+    
+    model_for_extraction.load_state_dict(state_dict, strict=False)
     print(f"'{MODEL_PATH}' から学習済み重みをロードしました。")
     
     # 特徴抽出の実行
-    print("--- GPU/CPUで特徴ベクトル抽出開始 ---")
+    print("--- 4096次元特徴ベクトル抽出開始 ---")
     embeddings, labels = extract_embeddings(model_for_extraction, all_loader, device)
 
     # 結果の保存
-    # Faissで効率的に検索できるように、特徴ベクトルをL2正規化
+    os.makedirs('ptfile', exist_ok=True)
+    os.makedirs('binfile', exist_ok=True)
+
     embeddings_np = embeddings.numpy().astype('float32') 
     
-    # L2正規化
     faiss.normalize_L2(embeddings_np)
     
-    # Faissインデックスを構築 
-    d = embeddings_np.shape[1] 
+    d = embeddings_np.shape[1] # 4096になるはず
     index = faiss.IndexFlatL2(d)
     index.add(embeddings_np)
     
-    # Faissをファイルに保存
-    faiss.write_index(index, 'faiss_index.bin')
-    print("Faissインデックスを 'faiss_index.bin' として保存しました。")
+    faiss.write_index(index, BINFILE_PATH)
+    print(f"Faissインデックス（{d}次元）を '{BINFILE_PATH}' として保存しました。")
     
-    # NumPyに変換された正規化済みの特徴ベクトルをembeddings.ptに保存
     torch.save({
         'embeddings': torch.from_numpy(embeddings_np), 
         'labels': labels,
         'class_names': all_loader.dataset.classes, 
         'dataset_size': len(all_loader.dataset)
-    }, 'embeddings.pt')
+    }, PTFILE_PATH)
 
-    print(f"全アイテムの特徴ベクトル ({embeddings_np.shape[0]}点, {embeddings_np.shape[1]}次元) を 'embeddings.pt' として保存しました。")
+    print(f"全アイテムの特徴ベクトル ({embeddings_np.shape[0]}点, {embeddings_np.shape[1]}次元) を '{PTFILE_PATH}' として保存しました。")
     
-except FileNotFoundError:
-    print(f"エラー: 重みファイル '{MODEL_PATH}' が見つかりません。model.pyの学習を完了させてください。", file=sys.stderr)
+except FileNotFoundError as e:
+    print(f"エラー: {e}\nmodel.pyの学習を完了させ、必要なファイルを生成してください。", file=sys.stderr)
 except Exception as e:
     print(f"特徴抽出中にエラーが発生しました: {e}", file=sys.stderr)

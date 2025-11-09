@@ -12,28 +12,38 @@ import base64
 from torchvision import transforms
 from model import get_model, num_classes 
 import torch.nn as nn 
+import traceback # トレースバック出力用
 
 app = Flask(__name__)
 
-# --- グローバル変数 ---
+# --- グローバル変数とパス定義 ---
 EMBEDDINGS = None
 LABELS = None
 CLASS_NAMES = None
 DATASET_SIZE = 0
-DATA_ROOT = './data/FashionMNIST/raw' 
+DATA_ROOT = os.path.join('.', 'data', 'FashionMNIST', 'raw') 
 
 FAISS_INDEX = None 
 MODEL_FOR_UPLOAD = None 
+
+PTFILE_PATH = os.path.join('ptfile', 'embeddings.pt')
+BINFILE_PATH = os.path.join('binfile', 'faiss_index.bin')
+MODEL_PATH_ABS = os.path.join('pthfile', 'fashion_classifier_model.pth')
 
 RAW_IMAGE_FILE = 'train-images-idx3-ubyte'
 MNIST_HEADER_SIZE = 16 
 
 # --- PyTorchモデルと前処理関数 ---
-data_transform = transforms.Compose([
-    transforms.Resize(224), 
+
+# テンソル変換・3ch複製・正規化のみを行うパイプライン
+upload_tensor_transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485], std=[0.229])
+    # 1ch画像を3chに複製
+    transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+    # 3chのImageNetの平均と標準偏差で正規化
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 
 ])
+
 
 # データのロード (サーバー起動時に一度だけ実行)
 def load_data():
@@ -45,33 +55,41 @@ def load_data():
 
     print("--- データロード開始 ---")
     try:
-        # 特徴ベクトルとラベルをロード
-        data = torch.load('ptfile/embeddings.pt')
+        # 1. 特徴ベクトルとラベルをロード
+        if not os.path.exists(PTFILE_PATH):
+            raise FileNotFoundError(f"特徴ベクトルファイル '{PTFILE_PATH}' が見つかりません。")
+            
+        data = torch.load(PTFILE_PATH)
         EMBEDDINGS = data['embeddings'].numpy().astype('float32') 
         LABELS = data['labels'].numpy()
         DATASET_SIZE = EMBEDDINGS.shape[0]
         print(f"特徴ベクトルロード成功。サイズ: {DATASET_SIZE}")
         
-        # Faissインデックスをロード
-        FAISS_INDEX = faiss.read_index('binfile/faiss_index.bin')
+        # 2. Faissインデックスをロード
+        if not os.path.exists(BINFILE_PATH):
+            raise FileNotFoundError(f"Faissインデックスファイル '{BINFILE_PATH}' が見つかりません。")
+            
+        FAISS_INDEX = faiss.read_index(BINFILE_PATH)
         print(f"Faissインデックスロード成功。次元: {FAISS_INDEX.d}")
 
-        # 特徴抽出モデルのロード (アップロード処理用)
-        MODEL_PATH = 'pthfile/fashion_classifier_model.pth'
+        # 3. 特徴抽出モデルのロード (アップロード処理用)
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # モデルの初期化 (model.pyで1チャネル入力に修正済み)
+        if not os.path.exists(MODEL_PATH_ABS):
+            raise FileNotFoundError(f"モデル重みファイル '{MODEL_PATH_ABS}' が見つかりません。")
+            
+        # feature_extractor_only=True で4096次元を出力するモデルをロード
         MODEL_FOR_UPLOAD = get_model(num_classes=num_classes, feature_extractor_only=True)
         
         # 学習済み重みのロード
-        state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+        state_dict = torch.load(MODEL_PATH_ABS, map_location=device, weights_only=True)
 
-        # feature_extractor_only=Trueでモデルを定義し、最終層の重みが不足するため、無視する
+        # 最終層の重みが不足するため、strict=Falseで無視する
         MODEL_FOR_UPLOAD.load_state_dict(state_dict, strict=False)
         MODEL_FOR_UPLOAD.to(device)
-        MODEL_FOR_UPLOAD.eval() # 評価モードに設定
+        MODEL_FOR_UPLOAD.eval() 
         
-        print(f"特徴抽出モデルロード成功: '{MODEL_PATH}' on {device}")
+        print(f"特徴抽出モデルロード成功: '{MODEL_PATH_ABS}' on {device}")
         
         return True
     except FileNotFoundError as e:
@@ -83,7 +101,7 @@ def load_data():
 
 # 画像データ取得ヘルパー
 def get_image_data(index):
-    file_path = os.path.join(DATA_ROOT, RAW_IMAGE_FILE)
+    file_path = os.path.join(DATA_ROOT, 'train-images-idx3-ubyte')
     
     if not os.path.exists(file_path):
         compressed_path = file_path + '.gz'
@@ -95,6 +113,7 @@ def get_image_data(index):
             raise FileNotFoundError(f"画像ファイルが見つかりません: {file_path} または {compressed_path}")
             
     image_size = 28 * 28
+    MNIST_HEADER_SIZE = 16 
     offset = MNIST_HEADER_SIZE + (index * image_size)
     
     with open(file_path, 'rb') as f:
@@ -138,7 +157,6 @@ def get_recommendations(target_index, num_recommendations=5):
 
 
 # Flask ルート
-
 @app.before_request
 def before_first_request():
     if FAISS_INDEX is None:
@@ -212,29 +230,39 @@ def upload_recommend_api():
         return jsonify({'error': 'ファイル名が空です'}), 400
 
     try:
-        # 画像の読み込みと前処理
-        img = Image.open(io.BytesIO(file.read()))
-        img_gray = img.convert('L')
-        # data_transform(img_gray)の結果、input_tensorは [1, 224, 224] (1ch)
-        input_tensor = data_transform(img_gray)
+        # 画像の読み込みと前処理 (堅牢なPIL処理)
+        img_bytes = file.read()
+        img = Image.open(io.BytesIO(img_bytes))
         
-        # モデルの入力に合わせてバッチ次元を追加 [1, 1, 224, 224]
-        input_batch = input_tensor.unsqueeze(0) 
+        # RGBモードに強制変換（様々な画像形式に対応）
+        img_copy = img.convert('RGB')
         
-        inputs_3ch = input_batch.repeat(1, 3, 1, 1) 
+        # VGG16の入力サイズにリサイズ
+        img_resized = img_copy.resize((224, 224), resample=Image.Resampling.NEAREST)
+        
+        # グレースケールに変換（Fashion-MNISTで転移学習しているため）
+        img_gray = img_resized.convert('L') 
+        
+        # ンソル変換・3ch複製・正規化を実行
+        input_tensor_3ch = upload_tensor_transform(img_gray)
+        
+        # モデルの入力に合わせてバッチ次元を追加 [1, 3, 224, 224]
+        inputs_to_model = input_tensor_3ch.unsqueeze(0) 
 
         # デバイスへの移動と特徴抽出
         device = next(MODEL_FOR_UPLOAD.parameters()).device 
-        inputs_to_model = inputs_3ch.to(device) 
+        inputs_to_model = inputs_to_model.to(device)
 
         with torch.no_grad():
-            # 3chのテンソルをモデルに入力
+            # 4096次元の特徴ベクトルを取得
             features = MODEL_FOR_UPLOAD(inputs_to_model) 
             upload_embedding = features.cpu().numpy().astype('float32')
+            
         # Faissでの検索
         faiss.normalize_L2(upload_embedding) 
         K = 5 
         
+        # 次元が4096次元で一致しているため、検索が成功する
         Distances, Indices = FAISS_INDEX.search(upload_embedding, K)
         
         # 結果の整形
@@ -254,7 +282,8 @@ def upload_recommend_api():
 
         # ターゲット画像のデータURLを生成
         img_io = io.BytesIO()
-        img.resize((224, 224), resample=Image.Resampling.NEAREST).save(img_io, 'PNG') 
+        # リサイズ済みのカラー画像をデータURLに含める
+        img_resized.save(img_io, 'PNG') 
         img_data_url = "data:image/png;base64," + base64.b64encode(img_io.getvalue()).decode('utf-8')
         
         target_item = {
@@ -269,8 +298,12 @@ def upload_recommend_api():
         })
 
     except Exception as e:
-        print(f"アップロード画像処理エラー: {e}")
-        return jsonify({'error': f'画像処理中にエラーが発生しました: {e}'}), 500
+        print("\n--- アップロード画像処理エラー詳細 ---")
+        traceback.print_exc() 
+        print("----------------------------------\n")
+        
+        error_message = f"{type(e).__name__}: {e}"
+        return jsonify({'error': f'画像処理中にエラーが発生しました: {error_message}'}), 500
 
 
 if __name__ == '__main__':
