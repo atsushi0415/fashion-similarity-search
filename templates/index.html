@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VGG16 Faiss高速ファッション推薦デモ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        .item-card {
+            transition: all 0.2s ease-in-out;
+            cursor: pointer;
+            border: 3px solid transparent;
+        }
+        .item-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        .target-card {
+            border-color: #3b82f6; /* 青色 */
+            box-shadow: 0 0 0 5px rgba(59, 130, 246, 0.5);
+        }
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mx-auto p-4 md:p-8">
+        <header class="text-center mb-8">
+            <h1 class="text-3xl font-extrabold text-gray-800">VGG16 & Faiss ファッション推薦デモ</h1>
+            <p class="text-gray-600 mt-2">データセットまたはアップロード画像から類似アイテムを高速検索</p>
+        </header>
+
+        <main class="bg-white p-6 md:p-10 rounded-xl shadow-2xl">
+            
+            <section class="mb-10">
+                <h2 class="text-2xl font-bold text-gray-700 mb-4 border-b pb-2">ターゲットアイテム</h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
+                    
+                    <div id="target-card" class="target-card rounded-lg overflow-hidden shadow-lg p-4 bg-blue-50">
+                        <div class="aspect-square bg-gray-200 flex items-center justify-center rounded-md overflow-hidden">
+                            <img id="target-image" src="" alt="ターゲット画像" class="w-full h-full object-contain">
+                        </div>
+                        <div class="mt-3 text-center">
+                            <p class="text-xs text-gray-500">インデックス: <span id="target-index" class="font-mono font-semibold text-gray-700"></span></p>
+                            <p class="text-lg font-bold text-blue-700 mt-1" id="target-class"></p>
+                        </div>
+                    </div>
+
+                    <div class="md:col-span-2 space-y-4">
+                        <div class="bg-gray-50 p-4 rounded-lg shadow-inner">
+                            <h3 class="text-lg font-semibold text-gray-700 mb-2">データセットから検索</h3>
+                            <div class="flex space-x-2">
+                                <input type="number" id="item-index-input" placeholder="インデックスを入力 (0-59999)" class="w-full p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" min="0">
+                                <button id="search-by-index-btn" class="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg transition duration-150">検索</button>
+                            </div>
+                            <button id="random-item-btn" class="w-full mt-2 bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg transition duration-150">ランダムなアイテムをロード</button>
+                        </div>
+
+                        <div class="bg-gray-50 p-4 rounded-lg shadow-inner">
+                            <h3 class="text-lg font-semibold text-gray-700 mb-2">画像をアップロードして検索</h3>
+                            <input type="file" id="image-upload-input" accept="image/*" class="w-full p-2 border border-gray-300 rounded-lg bg-white file:mr-4 file:py-1 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <section>
+                <h2 class="text-2xl font-bold text-gray-700 mb-4 border-b pb-2">類似の推薦結果 (5件)</h2>
+                <div id="recommendation-list" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-6">
+                    <div id="initial-placeholder" class="col-span-full text-center p-8 text-gray-500">
+                        データをロードしています...
+                    </div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="text-center">
+            <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-3"></div>
+            <p class="text-xl text-blue-700 font-semibold">処理中...</p>
+        </div>
+    </div>
+
+
+    <script>
+        // Flaskから渡された初期インデックスを取得
+        const targetIndex = {{ initial_index }}; 
+        
+        const recommendationList = document.getElementById('recommendation-list');
+        const targetImage = document.getElementById('target-image');
+        const targetIndexElement = document.getElementById('target-index');
+        const targetClassElement = document.getElementById('target-class');
+        const initialPlaceholder = document.getElementById('initial-placeholder');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const searchByIndexBtn = document.getElementById('search-by-index-btn');
+        const itemIndexInput = document.getElementById('item-index-input');
+        const randomItemBtn = document.getElementById('random-item-btn');
+        const imageUploadInput = document.getElementById('image-upload-input');
+
+        // ローディング表示/非表示
+        function showLoading() {
+            loadingOverlay.classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            loadingOverlay.classList.add('hidden');
+        }
+
+        // コア機能
+        function updateUI(data) {
+            // ターゲットアイテムの表示更新
+            targetImage.src = data.target.image_url;
+            
+            if (data.target.index === 'UPLOAD') {
+                targetIndexElement.textContent = '---';
+                targetClassElement.textContent = 'アップロード画像';
+            } else {
+                targetIndexElement.textContent = data.target.index;
+                targetClassElement.textContent = data.target.class_name;
+            }
+
+            // 推薦リストの更新
+            recommendationList.innerHTML = '';
+            data.recommendations.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'item-card rounded-lg overflow-hidden shadow-md bg-white p-3 hover:shadow-xl hover:scale-[1.02] transition-transform duration-200';
+                card.setAttribute('data-index', item.index);
+                
+                card.innerHTML = `
+                    <div class="aspect-square bg-gray-100 flex items-center justify-center rounded-md overflow-hidden">
+                        <img src="${item.image_url}" alt="${item.class_name}" class="w-full h-full object-contain">
+                    </div>
+                    <div class="mt-2 text-center">
+                        <p class="text-sm font-semibold text-gray-800 truncate">${item.class_name}</p>
+                        <p class="text-xs text-gray-500">Index: ${item.index}</p>
+                        <p class="text-xs font-bold text-red-500">類似度: ${(item.similarity * 100).toFixed(2)}%</p>
+                    </div>
+                `;
+                
+                // クリックイベントを設定して、このアイテムを新しいターゲットにする
+                card.addEventListener('click', () => loadRecommendations(item.index));
+
+                recommendationList.appendChild(card);
+            });
+        }
+
+        // 推薦データをロードする関数
+        async function loadRecommendations(index) {
+            showLoading();
+            recommendationList.innerHTML = ''; // リストをクリア
+            
+            try {
+                const response = await fetch(`/recommend/${index}`);
+                if (!response.ok) {
+                    throw new Error('推薦データのロードに失敗しました。');
+                }
+                const data = await response.json();
+                updateUI(data);
+
+            } catch (error) {
+                console.error("検索エラー:", error);
+                recommendationList.innerHTML = `<div class="text-center p-4 col-span-full text-red-600">検索中にエラーが発生しました。<br>エラー: ${error.message}</div>`;
+            } finally {
+                hideLoading();
+            }
+        }
+
+        // 画像アップロードと推薦検索を処理する関数
+        async function handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            showLoading();
+            recommendationList.innerHTML = ''; // リストをクリア
+            
+            try {
+                const formData = new FormData();
+                formData.append('image', file);
+
+                // アップロードAPIに送信
+                const response = await fetch('/upload_recommend', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    // サーバーがJSON形式でエラーを返すと期待
+                    const errorJson = await response.json();
+                    throw new Error(errorJson.error || '画像アップロードと検索に失敗しました。');
+                }
+                
+                const data = await response.json();
+                updateUI(data);
+
+            } catch (error) {
+                console.error("画像アップロード検索エラー:", error);
+                // エラーメッセージをユーザーに表示
+                recommendationList.innerHTML = `<div class="text-center p-4 col-span-full text-red-600">アップロード画像の処理中にエラーが発生しました。<br>エラー: ${error.message}</div>`;
+            } finally {
+                // ファイル入力のリセット (連続で同じファイルをアップロードできるように)
+                imageUploadInput.value = ''; 
+                hideLoading();
+            }
+        }
+
+        // ランダムなアイテムをロードする関数
+        function loadRandomItem() {
+            window.location.reload(); 
+        }
+
+        // --- イベントリスナー ---
+        searchByIndexBtn.addEventListener('click', () => {
+            const index = parseInt(itemIndexInput.value);
+            if (!isNaN(index) && index >= 0) {
+                loadRecommendations(index);
+            } else {
+                alert('有効なインデックスを入力してください。');
+            }
+        });
+
+        randomItemBtn.addEventListener('click', loadRandomItem);
+        imageUploadInput.addEventListener('change', handleImageUpload);
+
+
+        // --- ページの初期ロード ---
+        window.onload = () => {
+            if (targetIndex !== undefined && targetIndex !== null && targetIndex >= 0) {
+                if (initialPlaceholder) initialPlaceholder.classList.add('hidden');
+                loadRecommendations(targetIndex);
+            } else {
+                 if (initialPlaceholder) initialPlaceholder.textContent = "初期化エラー: サーバー側のデータロードを確認してください。";
+                 hideLoading();
+            }
+        };
+
+    </script>
+</body>
+</html>
